@@ -13,6 +13,7 @@ import (
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/paths"
+	consulapi "github.com/hashicorp/consul/api"
 )
 
 type Registrar struct {
@@ -55,6 +56,10 @@ func New(registryFile string, flushTimeout time.Duration, out successLogger) (*R
 
 // Init sets up the Registrar and make sure the registry file is setup correctly
 func (r *Registrar) Init() error {
+	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
+		logp.Info("Using consul to load registrar data. CONSUL_HTTP_ADDR found")
+		return nil
+	}
 	// The registry file is opened in the data path
 	r.registryFile = paths.Resolve(paths.Data, r.registryFile)
 
@@ -82,10 +87,11 @@ func (r *Registrar) Init() error {
 		if fileInfo.IsDir() {
 			return fmt.Errorf("Registry file path must be a file. %s is a directory.", r.registryFile)
 		}
+		logp.Debug("registrar", "Registry file set to: %s", r.registryFile)
 		return fmt.Errorf("Registry file path is not a regular file: %s", r.registryFile)
 	}
 
-	logp.Debug("registrar", "Registry file set to: %s", r.registryFile)
+	logp.Info("Registry file set to: %s", r.registryFile)
 
 	return nil
 }
@@ -95,23 +101,68 @@ func (r *Registrar) GetStates() []file.State {
 	return r.states.GetStates()
 }
 
+func (r *Registrar) loadConsulStates() ([]file.State, error) {
+	states := []file.State{}
+	logp.Info("Using consul to load registrar data. CONSUL_HTTP_ADDR found")
+	consul, err := consulapi.NewClient(consulapi.DefaultConfig())
+	if err != nil {
+		logp.Err("Error when connecting to consul: %s", err)
+		return states, err
+	}
+	kv := consul.KV()
+	path := os.Getenv("CONSUL_KV_PATH") + "/registry"
+	if path == "" {
+		logp.Err("Error %s", "no CONSUL_KV_PATH found")
+		return states, err
+	}
+	kp, _, err := kv.Get(path, nil)
+	if err != nil {
+		logp.Err("Error when getting the states from consul: %s", err)
+		return states, err
+	}
+	if kp == nil {
+		return states, nil
+	}
+	logp.Debug("Got states from consul %#v\n", string(kp.Value))
+	json.Unmarshal(kp.Value, &states)
+	if err != nil {
+		logp.Err("Error when encoding the states: %s", err)
+		return states, err
+	}
+	if err != nil {
+		logp.Err("Error when putting the states into consul: %s", err)
+		return states, err
+	}
+	return states, nil
+}
+
 // loadStates fetches the previous reading state from the configure RegistryFile file
 // The default file is `registry` in the data path.
 func (r *Registrar) loadStates() error {
-	f, err := os.Open(r.registryFile)
-	if err != nil {
-		return err
-	}
-
-	defer f.Close()
-
-	logp.Info("Loading registrar data from %s", r.registryFile)
-
-	decoder := json.NewDecoder(f)
 	states := []file.State{}
-	err = decoder.Decode(&states)
-	if err != nil {
-		return fmt.Errorf("Error decoding states: %s", err)
+	var err error
+
+	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
+		states, err = r.loadConsulStates()
+		if err != nil {
+			return err
+		}
+	} else {
+		f, err := os.Open(r.registryFile)
+		if err != nil {
+			return err
+		}
+
+		defer f.Close()
+
+		logp.Info("Loading registrar data from %s", r.registryFile)
+
+		decoder := json.NewDecoder(f)
+
+		err = decoder.Decode(&states)
+		if err != nil {
+			return fmt.Errorf("Error decoding states: %s", err)
+		}
 	}
 
 	states = resetStates(states)
@@ -223,8 +274,49 @@ func (r *Registrar) flushRegistry() {
 	r.bufferedStateUpdates = 0
 }
 
+func (r *Registrar) writeConsulRegistry(states []file.State) error {
+	logp.Debug("Using consul to write registrar data. %s", "CONSUL_HTTP_ADDR found")
+	consul, err := consulapi.NewClient(consulapi.DefaultConfig())
+	if err != nil {
+		logp.Err("Error when connecting to consul: %s", err)
+		return err
+	}
+	kv := consul.KV()
+	path := os.Getenv("CONSUL_KV_PATH") + "/registry"
+	if path == "" {
+		logp.Err("Error %s", "no CONSUL_KV_PATH found")
+		return err
+	}
+	jstates, err := json.Marshal(states)
+	if err != nil {
+		logp.Err("Error when encoding the states: %s", err)
+		return err
+	}
+	logp.Debug("Consul write %#v", string(jstates))
+	p := &consulapi.KVPair{Key: path, Value: jstates}
+	_, err = kv.Put(p, nil)
+	if err != nil {
+		logp.Err("Error when putting the states into consul: %s", err)
+		return err
+	}
+	return nil
+}
+
 // writeRegistry writes the new json registry file to disk.
 func (r *Registrar) writeRegistry() error {
+	// First clean up states
+	states := r.states.GetStates()
+
+	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
+		err := r.writeConsulRegistry(states)
+		if err != nil {
+			return err
+		}
+		registryWrites.Add(1)
+		statesCurrent.Set(int64(len(states)))
+
+		return nil
+	}
 	logp.Debug("registrar", "Write registry file: %s", r.registryFile)
 
 	tempfile := r.registryFile + ".new"
@@ -233,9 +325,6 @@ func (r *Registrar) writeRegistry() error {
 		logp.Err("Failed to create tempfile (%s) for writing: %s", tempfile, err)
 		return err
 	}
-
-	// First clean up states
-	states := r.states.GetStates()
 
 	encoder := json.NewEncoder(f)
 	err = encoder.Encode(states)
