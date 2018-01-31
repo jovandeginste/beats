@@ -268,7 +268,7 @@ func (r *Registrar) flushRegistry() {
 }
 
 func (r *Registrar) writeConsulRegistry(states []file.State) error {
-	logp.Info("Using consul to write registrar data. CONSUL_HTTP_ADDR found")
+	logp.Debug("Using consul to write registrar data. %s", "CONSUL_HTTP_ADDR found")
 	consul, err := consulapi.NewClient(consulapi.DefaultConfig())
 	if err != nil {
 		logp.Err("Error when connecting to consul: %s", err)
