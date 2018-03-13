@@ -56,37 +56,41 @@ func New(registryFile string, flushTimeout time.Duration, out successLogger) (*R
 
 // Init sets up the Registrar and make sure the registry file is setup correctly
 func (r *Registrar) Init() error {
-	// The registry file is opened in the data path
-	r.registryFile = paths.Resolve(paths.Data, r.registryFile)
+	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
+		logp.Info("Using consul to load registrar data. CONSUL_HTTP_ADDR found")
+	} else {
+		// The registry file is opened in the data path
+		r.registryFile = paths.Resolve(paths.Data, r.registryFile)
 
-	// Create directory if it does not already exist.
-	registryPath := filepath.Dir(r.registryFile)
-	err := os.MkdirAll(registryPath, 0750)
-	if err != nil {
-		return fmt.Errorf("Failed to created registry file dir %s: %v", registryPath, err)
-	}
-
-	// Check if files exists
-	fileInfo, err := os.Lstat(r.registryFile)
-	if os.IsNotExist(err) {
-		logp.Info("No registry file found under: %s. Creating a new registry file.", r.registryFile)
-		// No registry exists yet, write empty state to check if registry can be written
-		return r.writeRegistry()
-	}
-	if err != nil {
-		return err
-	}
-
-	// Check if regular file, no dir, no symlink
-	if !fileInfo.Mode().IsRegular() {
-		// Special error message for directory
-		if fileInfo.IsDir() {
-			return fmt.Errorf("Registry file path must be a file. %s is a directory.", r.registryFile)
+		// Create directory if it does not already exist.
+		registryPath := filepath.Dir(r.registryFile)
+		err := os.MkdirAll(registryPath, 0750)
+		if err != nil {
+			return fmt.Errorf("Failed to created registry file dir %s: %v", registryPath, err)
 		}
-		return fmt.Errorf("Registry file path is not a regular file: %s", r.registryFile)
-	}
 
-	logp.Info("Registry file set to: %s", r.registryFile)
+		// Check if files exists
+		fileInfo, err := os.Lstat(r.registryFile)
+		if os.IsNotExist(err) {
+			logp.Info("No registry file found under: %s. Creating a new registry file.", r.registryFile)
+			// No registry exists yet, write empty state to check if registry can be written
+			return r.writeRegistry()
+		}
+		if err != nil {
+			return err
+		}
+
+		// Check if regular file, no dir, no symlink
+		if !fileInfo.Mode().IsRegular() {
+			// Special error message for directory
+			if fileInfo.IsDir() {
+				return fmt.Errorf("Registry file path must be a file. %s is a directory.", r.registryFile)
+			}
+			return fmt.Errorf("Registry file path is not a regular file: %s", r.registryFile)
+		}
+
+		logp.Info("Registry file set to: %s", r.registryFile)
+	}
 
 	return nil
 }
@@ -134,17 +138,8 @@ func (r *Registrar) loadConsulStates() ([]file.State, error) {
 // loadStates fetches the previous reading state from the configure RegistryFile file
 // The default file is `registry` in the data path.
 func (r *Registrar) loadStates() error {
-	f, err := os.Open(r.registryFile)
-	if err != nil {
-		return err
-	}
-
-	defer f.Close()
-
-	logp.Info("Loading registrar data from %s", r.registryFile)
-
-	decoder := json.NewDecoder(f)
 	states := []file.State{}
+	var err error
 
 	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
 		states, err = r.loadConsulStates()
@@ -152,6 +147,17 @@ func (r *Registrar) loadStates() error {
 			return err
 		}
 	} else {
+		f, err := os.Open(r.registryFile)
+		if err != nil {
+			return err
+		}
+
+		defer f.Close()
+
+		logp.Info("Loading registrar data from %s", r.registryFile)
+
+		decoder := json.NewDecoder(f)
+
 		err = decoder.Decode(&states)
 		if err != nil {
 			return fmt.Errorf("Error decoding states: %s", err)
@@ -297,41 +303,45 @@ func (r *Registrar) writeConsulRegistry(states []file.State) error {
 
 // writeRegistry writes the new json registry file to disk.
 func (r *Registrar) writeRegistry() error {
-	logp.Debug("registrar", "Write registry file: %s", r.registryFile)
-
-	tempfile := r.registryFile + ".new"
-	f, err := os.OpenFile(tempfile, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0600)
-	if err != nil {
-		logp.Err("Failed to create tempfile (%s) for writing: %s", tempfile, err)
-		return err
-	}
-
 	// First clean up states
 	states := r.states.GetStates()
 
 	if os.Getenv("CONSUL_HTTP_ADDR") != "" {
-		err = r.writeConsulRegistry(states)
+		err := r.writeConsulRegistry(states)
 		if err != nil {
 			return err
 		}
-	}
+		registryWrites.Add(1)
+		statesCurrent.Set(int64(len(states)))
 
-	encoder := json.NewEncoder(f)
-	err = encoder.Encode(states)
-	if err != nil {
+		return nil
+	} else {
+		logp.Debug("registrar", "Write registry file: %s", r.registryFile)
+
+		tempfile := r.registryFile + ".new"
+		f, err := os.OpenFile(tempfile, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0600)
+		if err != nil {
+			logp.Err("Failed to create tempfile (%s) for writing: %s", tempfile, err)
+			return err
+		}
+
+		encoder := json.NewEncoder(f)
+		err = encoder.Encode(states)
+		if err != nil {
+			f.Close()
+			logp.Err("Error when encoding the states: %s", err)
+			return err
+		}
+
+		// Directly close file because of windows
 		f.Close()
-		logp.Err("Error when encoding the states: %s", err)
+
+		err = helper.SafeFileRotate(r.registryFile, tempfile)
+
+		logp.Debug("registrar", "Registry file updated. %d states written.", len(states))
+		registryWrites.Add(1)
+		statesCurrent.Set(int64(len(states)))
+
 		return err
 	}
-
-	// Directly close file because of windows
-	f.Close()
-
-	err = helper.SafeFileRotate(r.registryFile, tempfile)
-
-	logp.Debug("registrar", "Registry file updated. %d states written.", len(states))
-	registryWrites.Add(1)
-	statesCurrent.Set(int64(len(states)))
-
-	return err
 }
